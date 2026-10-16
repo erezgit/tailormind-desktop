@@ -26,6 +26,7 @@ import path from "path";
 import { spawnSync } from "child_process";
 import net from "node:net";
 import dns from "node:dns";
+import { isEcho } from "./echo.mjs";
 // ⛔ NETWORK: IPv4 first, and no address race. Erez's Mac runs NordVPN: IPv6 is
 // unreachable through it and a connect takes longer than Node's 250 ms happy-eyeballs
 // attempt, so EVERY fetch (Neon, Cloudflare) died "fetch failed"/ETIMEDOUT while curl
@@ -192,8 +193,27 @@ const journal = path.join(dir, "chunks.jsonl");
 const doneFile = path.join(dir, "done");
 const progressFile = path.join(dir, "transcribed.json");
 const linesFile = path.join(dir, "lines.jsonl");
+const echoFile = path.join(dir, "echo.jsonl");       // mic lines dropped as speaker echo, kept for audit
+const speakingFile = path.join(dir, "system.speaking"); // the recorder holds it while the system track is mid-sentence
 const seen = new Set(fs.existsSync(progressFile) ? JSON.parse(fs.readFileSync(progressFile, "utf8")) : []);
 let seq = fs.existsSync(linesFile) ? fs.readFileSync(linesFile, "utf8").split("\n").filter(Boolean).length : 0;
+
+// ── Echo: what the system track just played, so the mic's copy of it can be dropped ──
+// Rebuilt from lines.jsonl on restart; walls come from the journal (the tracks' start_s drift).
+const systemLines = [];
+{
+  const walls = Object.fromEntries((fs.existsSync(journal) ? fs.readFileSync(journal, "utf8").split("\n").filter(Boolean) : [])
+    .map((l) => JSON.parse(l)).map((c) => [c.file, c.wall]));
+  if (fs.existsSync(linesFile)) for (const l of fs.readFileSync(linesFile, "utf8").split("\n").filter(Boolean)) {
+    const r = JSON.parse(l);
+    if (r.track === "system" && walls[r.raw?.chunk]) systemLines.push({ wall: walls[r.raw.chunk], text: r.words });
+  }
+}
+/** True while the system track is mid-sentence: its chunk is not cut yet, so a mic chunk must wait for it.
+ *  A flag older than 30 s is stale (the recorder died holding it) and is ignored. */
+function systemSpeaking() {
+  try { return Date.now() - fs.statSync(speakingFile).mtimeMs < 30000; } catch { return false; }
+}
 
 // ── Neon, in the background ──
 // Rows are queued with the local seq; on restart, lines not yet in Neon are re-queued from
@@ -238,8 +258,21 @@ async function processChunk(c) {
   const file = path.join(dir, c.file);
   if (c.rms < SILENCE_RMS) { log(`${c.file} silent (rms ${c.rms.toFixed(4)}) — skipped`); return; }
   const t0 = Date.now();
-  const phrases = await transcribe(file);
+  let phrases = await transcribe(file);
   if (!phrases.length) { log(`${c.file} no speech`); return; }
+  if (c.track === "system") {
+    for (const p of phrases) systemLines.push({ wall: c.wall, text: p.text });
+    while (systemLines.length && systemLines[0].wall < c.wall - 180) systemLines.shift();
+  } else if (c.track === "mic") {
+    phrases = phrases.filter((p) => {
+      const e = isEcho(p.text, c, systemLines);
+      if (!e.echo) return true;
+      log(`${c.file} ECHO dropped (score ${e.score.toFixed(2)}) → ${p.text.slice(0, 80)}`);
+      fs.appendFileSync(echoFile, JSON.stringify({ chunk: c.file, score: e.score, text: p.text }) + "\n");
+      return false;
+    });
+    if (!phrases.length) return;
+  }
   const rows = phrases.map((p) => ({
     seq: ++seq, track: c.track, speaker_name: SPEAKER[c.track] || c.track, is_host: c.track === "mic",
     words: p.text, start_ts: +(c.start_s + p.start).toFixed(2), end_ts: +(c.start_s + p.end).toFixed(2), language: p.lang,
@@ -259,9 +292,13 @@ flushNeon();
 let failures = 0;
 for (;;) {
   const lines = fs.existsSync(journal) ? fs.readFileSync(journal, "utf8").split("\n").filter(Boolean) : [];
-  for (const line of lines) {
-    const c = JSON.parse(line);
-    if (seen.has(c.file)) continue;
+  // System chunks first, so a mic chunk is always compared against what the speakers played;
+  // and a mic chunk waits while the system track is mid-sentence (its chunk is not cut yet).
+  const pending = lines.map((l) => JSON.parse(l)).filter((c) => !seen.has(c.file));
+  pending.sort((a, b) => (a.track === "system" ? 0 : 1) - (b.track === "system" ? 0 : 1));
+  const holdMic = systemSpeaking();
+  for (const c of pending) {
+    if (holdMic && c.track === "mic") break;
     try {
       await processChunk(c);
       seen.add(c.file);

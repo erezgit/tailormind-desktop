@@ -141,7 +141,7 @@ final class Track {
             floor = rms < floor ? rms : floor + (rms - floor) * 0.002
             let speech = rms > max(0.004, floor * 3)
             scanned += frame
-            if speech { heardSpeech = true; silentRun = 0 } else { silentRun += frame }
+            if speech { if !heardSpeech { setSpeaking(true) }; heardSpeech = true; silentRun = 0 } else { silentRun += frame }
 
             if heardSpeech && silentRun >= Int(0.5 * SR) && scanned >= Int(1.0 * SR) {
                 // The sentence ended: cut 0.25 s into the pause, keeping a little tail.
@@ -200,6 +200,17 @@ final class Track {
         scanned = max(0, scanned - n)
         heardSpeech = false
         silentRun = 0
+        setSpeaking(false)      // AFTER the journal line, so the transcriber finds the chunk it waited for
+    }
+
+    /// Echo filter (16 Oct 2026): `system.speaking` exists while the SYSTEM track is mid-sentence.
+    /// The transcriber holds mic chunks until it is gone, so a mic line that is only the speakers
+    /// coming back through the microphone is always compared against what the speakers played.
+    func setSpeaking(_ on: Bool) {
+        guard name == "system" else { return }
+        let f = outDir.appendingPathComponent("system.speaking")
+        if on { FileManager.default.createFile(atPath: f.path, contents: nil) }
+        else { try? FileManager.default.removeItem(at: f) }
     }
 
     func flush() {
